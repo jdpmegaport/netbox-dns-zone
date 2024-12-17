@@ -8,7 +8,7 @@ import click
 import netaddr
 import jinja2
 import dotenv
-from datetime import datetime
+import datetime as dt
 import hashlib
 import dns.name
 import dns.reversename
@@ -121,14 +121,12 @@ def cli():
 @click.argument('zone-file', metavar='<zone file>', required=False, type=click.File('w'))
 @click.option('--url', envvar='NETBOX_URL', show_default='$NETBOX_URL', required=True, help='Netbox base URL')
 @click.option('--token', envvar='NETBOX_TOKEN', show_default='$NETBOX_TOKEN', required=True, help='Netbox API Token')
-@click.option('--parent-prefix', 'parent_prefixes', metavar='CIDR', multiple=True, show_default=True, default=('0.0.0.0/0', '::/0'),
-    callback=validate_prefix, help='Limit IP Adresses to the specified prefixes (can be specified multiple times)')
 @click.option('--nameserver', 'nameservers', metavar='DNSNAME', multiple=True, required=True, callback=validate_dns_name,
     help='Nameserver names of the zone (can be specified multiple times)')
 @click.option('--include', 'includes', metavar='FILE', multiple=True, default=[], type=click.File('r'),
     help='Files to include at the end of the generated zone file (can be specified multiple times)')
 @click.option('--zone', metavar='DNSNAME', callback=validate_dns_name, required=True, help='Zone name')
-@click.option('--serial', show_default='current timestamp', default=int(datetime.utcnow().timestamp()), help='SOA Serial')
+@click.option('--serial', show_default='current timestamp', default=int(dt.datetime.now(dt.UTC).timestamp()), help='SOA Serial')
 @click.option('--refresh', type=int, show_default=True, default=86400, help='SOA Refresh')
 @click.option('--retry', type=int, show_default=True, default=7200, help='SOA Retry')
 @click.option('--expire', type=int, show_default=True, default=3600000, help='SOA Expire')
@@ -144,9 +142,11 @@ def cli():
 @click.option('--hash-reset-serial/--no-hash-reset-serial', default=True)
 @click.option('--hash-only', is_flag=True)
 @click.option('--github-actions', is_flag=True, envvar='GITHUB_ACTIONS')
-def generate(zone_file, url, token, parent_prefixes, nameservers, includes,
+@click.option("--oob-address", is_flag=True, help="Use OOB addresses (otherwise primary_ip4/6 will be used)")
+@click.option("--include-vms", is_flag=True, help="Include virtual machines")
+def generate(zone_file, url, token, nameservers, includes,
     zone, serial, refresh, retry, expire, ttl, relativize, reverse_prefix, validate, template_path,
-    hash_remove_txt_attributes, hash_reset_serial, hash_only, github_actions):
+    hash_remove_txt_attributes, hash_reset_serial, hash_only, github_actions, oob_address, include_vms):
     """
     Generates a zone file. Use '-' for stdout.
     """
@@ -170,17 +170,19 @@ def generate(zone_file, url, token, parent_prefixes, nameservers, includes,
     env.filters['reverse_name'] = filter_reverse_name
 
     nb = pynetbox.api(url, token)
-    ip_addresses = list(nb.ipam.ip_addresses.filter(parent=(reverse_prefix or parent_prefixes)))
+    devices = list(nb.dcim.devices.filter(status="active"))
+    if include_vms:
+        devices.extend(nb.virtualization.virtual_machines.filter(status="active"))
+    devices = list(filter(lambda device: device["primary_ip4"] or device["primary_ip6"], devices))
     if not reverse_prefix:
-        ip_addresses = list(filter(lambda addr: not addr['dns_name'] or dns.name.from_text(addr['dns_name'], origin=origin).is_subdomain(origin), ip_addresses))
-
+        devices = list(filter(lambda device: not device['name'] or dns.name.from_text(device['name'], origin=origin).is_subdomain(origin), devices))
     # Ensure nameservers are qualified
     _nameservers = list(map(lambda name: dns.name.from_text(name, origin), nameservers))
-
     zone_template = env.get_template('zone.j2' if not reverse_prefix else 'zone-reverse.j2')
     rendered_zone = zone_template.render(
         nameservers=_nameservers,
-        addresses=ip_addresses,
+        devices=devices,
+        oob_address=oob_address,
         origin=origin,
         reverse_origin=reverse_origin,
         serial=serial,
@@ -188,7 +190,7 @@ def generate(zone_file, url, token, parent_prefixes, nameservers, includes,
         retry=retry,
         expire=expire,
         ttl=ttl,
-        timestamp=datetime.utcnow().isoformat(timespec='seconds'),
+        timestamp=dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'),
         includes=includes
     )
 
